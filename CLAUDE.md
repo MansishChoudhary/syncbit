@@ -66,28 +66,31 @@ between #3/#4 by which is cheaper to build in the remaining time.
 | Term | Meaning |
 |---|---|
 | OTA | On-Time Arrival % — trips/employees arriving within SLA window of scheduled time |
-| Home pickup | Cab picks up employee directly from residence |
-| Nodal pickup | Employees converge on a fixed node; one cab serves multiple employees from that node |
-| Shuttle | Fixed-route, fixed-schedule, multi-stop vehicle, higher occupancy, lower personalization |
-| No-show | Employee booked but did not board |
-| Dead mileage | Distance driven without a revenue passenger (repositioning, empty legs) |
-| Escort compliance | For safety-mandated (e.g. night-shift) trips, presence of required security escort vs required |
-| Fill rate / occupancy | Actual riders ÷ capacity (or ÷ planned riders) |
+| Home pickup | Cab picks up employee directly from residence — `product_type=CAB`, `trip_nodal` = `HOME`/`NA` |
+| Nodal pickup | Employees converge on a fixed node; one cab serves multiple from it — `trip_nodal=NODAL` |
+| Shuttle | Fixed-route, fixed-schedule, multi-stop vehicle — `product_type=BUS` and/or `trip_nodal=SHUTTLE` |
+| `SPOT_2.0` | A fourth mode value present in the real data, not in the classic home/nodal/shuttle taxonomy — on-demand/micro-transit, best guess. Keep as its own bucket rather than forcing it into one of the three; don't guess harder than the data supports |
+| No-show | Employee booked but did not board — `noshow_cnt` at trip grain, `is_no_show`/`boarding_status` at employee-leg grain |
+| Dead mileage | Classic meaning: repositioning km with no passenger. **This dataset has no separate empty-leg field** — the closest proxy is the gap between `planned_km` and `traveled_km` (route/distance variance), which is detour or inefficiency, not true dead mileage. Label it as such in the UI, don't call it "dead mileage" without a caveat |
+| Escort compliance | **This dataset has `actual_escort` (was an escort present) but no `escort_required` flag.** There is no ground truth for "should have had an escort." MVP metric is escort *presence rate*, trended/benchmarked — not a compliance gap. A `required` proxy (e.g. night shifts by `shift_type`) is a stretch-goal config rule, not a fact the data asserts |
+| Fill rate / occupancy | `actualemployee_cnt` ÷ `actual_cab_capacity` (trip grain, already in `ride_data_trip` — no need to touch `emp_data`) |
 | SLA | Contractual/target service level, e.g. OTA ≥ 90% |
 | Materiality | How much a deviation matters in absolute terms (employees affected, ₹ cost) — filters noise so small blips don't become signals |
 | Signal | One scored, triaged anomaly/event row emitted by C3 — one thing worth telling a human |
 | Brief | Persona-facing narrative bundling signals + narrative (morning brief / leadership brief) |
 | Scorecard | Vendor-level rollup vs SLA/peers, feeds leadership brief and escalations |
+| `business_unit` | The dataset's client-account field (`vanta-Aus`, `catalyst-Sac`, `orbit-Slc`, `vanta-Sea`, `pinnacle-Slc`). **Treat as `tenant_id`** — it's the only field that plausibly plays that role |
+| `stwid` | Rider/employee id. `0`/`"0"` is a placeholder for non-rider or trip-level rows — filter it out before any per-employee aggregation |
 
 ---
 
 ## The five components
 
 **C1 — Ingest & fact build**
-- In: raw CSVs → staging tables.
-- Does: resolves joins (trips/vendors/drivers/routes/employees/shifts), computes per-trip derived fields in one pass — arrival delta vs scheduled, detour ratio, occupancy, dead km, escort compliance, speeding events, CO2, GPS coverage %, roster-matched flag, feedback attach.
-- Out: `trip_fact`. Idempotent re-runs (re-running for a date replaces that date's rows, doesn't duplicate).
-- Must NOT: call an LLM, apply business judgement, aggregate across trips.
+- In: the five raw CSVs (`ride_data_trip` ×3 monthly files, `emp_data`, `bill_data`, `alerts_data`, `trip_feedback`) → staging tables, one per file.
+- Does: normalises join keys (strip commas from `trip_id`/`stwid`, cast to one type per side — `bill_data`'s `trip_id` has no commas, `emp_data`'s is already `int64`, the rest are comma-formatted strings), normalises the four different date/epoch formats, treats the literal string `"NA"` in `trip_nodal` as null explicitly (CSV/COPY import will not do this for you), then rolls `bill_data`/`alerts_data`/`trip_feedback` up to trip grain and joins onto the `ride_data_trip` hub. Computes per-trip derived fields in one pass — delay vs scheduled (already provided as `delay_minutes`), detour ratio (`traveled_km`/`planned_km`), fill rate (`actualemployee_cnt`/`actual_cab_capacity`), escort presence rate, alert counts by severity, avg feedback ratings, billed cost/km, CO2 (config emission factor × `traveled_km` by `actual_cab_fuel_type`).
+- Out: `trip_fact`, one row per `trip_id`. Idempotent re-runs (re-running for a date replaces that date's rows, doesn't duplicate).
+- Must NOT: call an LLM, apply business judgement, aggregate across trips. Must NOT pull in `emp_data` (1.6M employee-leg rows) unless a specific screen needs employee-level breakdown (gender/role/no-show-reason) — `ride_data_trip` already carries trip-level `plannedemployee_cnt`/`actualemployee_cnt`/`noshow_cnt`, which covers fill rate and no-show rate without the extra join. Treat `emp_data` as a stretch-goal enrichment, not an MVP dependency.
 
 **C2 — Aggregate & benchmark views**
 - In: `trip_fact`.
@@ -125,23 +128,32 @@ draft approval/send instead of in-process state.
 
 ## Metric definitions
 
-Dimensions for all: date, site, vendor, mode, shift, tenant. **⚠ = depends on a dataset
-field not yet confirmed to exist — verify in Step 0, cut the metric if absent.**
+Confirmed against the real dataset (`src/main/resources/data/`, dictionaries in its
+`Dictionary/` subfolder — see Table Shapes below for the five source files). Dimensions
+for all: `trip_date`, `office`, `vendor_id`/`vendor`, mode (`product_type`/`trip_nodal`),
+`shift_type`, `business_unit` (tenant).
 
-| Metric | Definition | ⚠ |
+| Metric | Definition | Source |
 |---|---|---|
-| OTA % | Trips arriving within SLA window of scheduled time ÷ total trips | needs scheduled + actual arrival timestamps |
-| Delay minutes | actual_arrival − scheduled_arrival, avg/median | same as above |
-| No-show rate | No-show trips ÷ booked trips | needs booking vs boarded flag ⚠ |
-| Dead mileage % | Non-revenue km ÷ total km | needs GPS trace + route km ⚠ |
-| Fill rate / occupancy | Actual occupants ÷ capacity | needs vehicle capacity field ⚠ |
-| Escort compliance % | Escort present ÷ escort required | needs escort_required + escort_present flags ⚠⚠ (may not exist in sample data — have a fallback story) |
-| Speeding events | Count of GPS points/segments over speed threshold | needs GPS trace granularity ⚠ |
-| Cost per trip / per km | Total cost ÷ count | needs cost data grain — per trip vs per vendor invoice ⚠ |
-| CO2 (sustainability) | Distance × emission factor by vehicle type | emission factors are our own config, not dataset-derived — label as illustrative in UI |
-| GPS coverage % | % of trip duration/distance with valid pings | needs GPS trace completeness ⚠ |
-| Roster-match rate | % of trips matched to expected roster/booking | needs a roster file — may not exist ⚠⚠ |
-| Feedback / CSAT | Avg rating or sentiment | needs feedback field type (numeric vs free text) ⚠ |
+| OTA % | Trips with `delay_minutes` ≤ SLA threshold ÷ total trips | `ride_data_trip.delay_minutes` (strip commas) |
+| Delay minutes | `delay_minutes`, avg/median; `delay_reason` gives the breakdown for attribution (`NODELAY`/`TRAFFIC`/`DRIVER`/`EMPLOYEE`) for free | `ride_data_trip` |
+| No-show rate | `noshow_cnt` ÷ `plannedemployee_cnt` | `ride_data_trip` (trip grain — no `emp_data` join needed) |
+| Fill rate / occupancy | `actualemployee_cnt` ÷ `actual_cab_capacity` | `ride_data_trip` |
+| Route/distance variance ("dead mileage" proxy) | `traveled_km` − `planned_km` (or the ratio); **not true dead mileage** — see glossary. Label accordingly in UI | `ride_data_trip` |
+| Escort presence rate | `actual_escort = true` ÷ total trips, trended/benchmarked | `ride_data_trip.actual_escort` — no `escort_required` field exists; do not call this "compliance" |
+| Non-compliance rate | `is_driver_nc` / `is_cab_nc` true ÷ total trips | `ride_data_trip` (reconcile dtype drift — bool in Jun/Jul, object in May) |
+| Safety/alert rate | Alert count ÷ trip count, by `event_type` and `severity`; Sev-1 volume spikes are the clearest proactive-alert trigger in this dataset | `alerts_data`, rolled up to trip/day/vendor grain (drop the stray `"False"` in `severity`, filter `stwid="0"` for per-rider views) |
+| Cost per trip / per km | `trip_cost` (strip commas) ÷ trip count or ÷ `total_trip_km` | `bill_data`, aggregated by `trip_id` — **row count (620,942) exceeds trip count (615,549), so this is a `SUM`/`GROUP BY trip_id`, not a 1:1 join**; also decide how to treat `total_trip_km=0` rows (excluded from denominator, not silently kept) |
+| CO2 (sustainability) | `traveled_km` × emission factor by `actual_cab_fuel_type` | `ride_data_trip`; emission factors are our own config, not dataset-derived — label as illustrative in UI |
+| CSAT / feedback | Avg of `route_rating`/`driver_rating`/`cab_rating`/`safety_rating`/`marshal_rating` (0–5) | `trip_feedback`, aggregated by `trip_id`; confirm in Step 1 whether `0` means "genuinely rated zero" or "unrated" before averaging — it changes the mean materially |
+
+**Dropped from the original plan, now that the real schema is known:** GPS coverage % and
+raw-GPS-trace-derived speeding events. The dataset does not include raw GPS pings —
+`alerts_data.event_type = OVER_SPEEDING` (and `VEHICLE_STOPPAGE`, `DEVICE_NOT_REACHABLE`)
+are the closest signal, already pre-derived by MoveInSync. Treat them as event counts, not
+something to recompute from a trace we don't have. Roster-match rate is also dropped —
+there is no roster file; `plannedemployee_cnt` vs `actualemployee_cnt` already covers the
+planned-vs-actual gap this metric was meant to capture.
 
 Long-term this table belongs in `docs/metrics.md` — keep it here for now so it loads with
 everything else in one file.
@@ -150,17 +162,39 @@ everything else in one file.
 
 ## Table & signal shapes (prose — no DDL, decide exact types during Step 1)
 
-**`trip_fact`** — one row per trip-leg. **Open grain question (resolve in Step 0):** if
-nodal/shuttle trips carry multiple employees, decide whether the fact table is per-trip
-(with an employee count) or per-employee-leg (with a trip_id grouping key). Per-employee-
-leg is usually right when no-show/feedback/roster-match are employee-level facts.
-Fields: trip_id, tenant_id, date, site_id, mode (cab/nodal/shuttle), vendor_id, driver_id,
-employee_id, shift, scheduled_pickup_time, actual_pickup_time, scheduled_arrival_time,
-actual_arrival_time, delay_minutes, planned_distance_km, actual_distance_km, dead_km,
-capacity, occupancy, fill_rate, escort_required, escort_present, gps_coverage_pct,
-speeding_event_count, cost, co2_kg, no_show_flag, roster_matched_flag, feedback_score,
-data_quality_flag (missing_gps / unmatched_roster / etc.), source_row_ref (traceability
-for drill-down back to staging).
+**Source data** lives in `src/main/resources/data/` — five files, full per-file
+dictionaries in its `Dictionary/` subfolder (read `Dictionary/README.md` first, it's the
+map): `Ride_data _trip-{may,June,July}_2026.csv` (one row = one trip, ~615K rows across
+three months — the hub), `emp_Data.csv` (one row = one employee's leg, 1.64M rows),
+`bill_data.csv` (one row = one billed line item, 621K rows), `alerts_data.csv` (one row =
+one safety/compliance alert, 52K rows), `trip_feedback.csv` (one row = one rider's rating
+of one leg, 513K rows). All five join on `trip_id`; the per-rider files also carry `stwid`.
+**Known quirks to design around, not discover mid-build:** `trip_id` is comma-formatted in
+every file except `bill_data` (plain numeric string) and `emp_data` (clean `int64`) —
+normalise before any join; `trip_nodal` uses the literal string `"NA"` for non-nodal
+trips, which a raw CSV import will not treat as null; date/epoch formats differ per file
+(see dictionary point 3–4); `is_driver_nc`/`is_cab_nc`/`planned_km` dtypes drift between
+the three monthly `ride_data_trip` files; `alerts_data.severity` has a stray literal
+`"False"`; `emp_data.planned_km`/`traveled_km` go negative (physically invalid).
+
+**Staging tables** — one per source file, columns as-is (all text/varchar is fine at this
+stage), plus a `source_file`/`load_batch` column for traceability. Load raw, clean in the
+transform step, not during load.
+
+**`trip_fact`** — one row per `trip_id` (grain matches the `ride_data_trip` hub — see C1).
+Core fields carried straight from `ride_data_trip`: trip_id, tenant_id (=`business_unit`),
+office, product_type, trip_nodal (mode refinement), trip_date, shift_type, trip_direction,
+vendor_id, actual_cab_registration, actual_cab_capacity, actual_cab_fuel_type, planned_km,
+traveled_km, planned/actual start/end timestamps (parsed from epoch), delay_minutes,
+delay_reason, route_source, is_driver_nc, is_cab_nc, actual_escort,
+plannedemployee_cnt, actualemployee_cnt, noshow_cnt.
+Derived/joined-in fields: fill_rate, detour_ratio, escort_presence (=actual_escort, see
+glossary caveat), co2_kg, billed_cost (SUM from `bill_data`), billed_km (SUM
+`total_trip_km`), contract, slab_name, alert_count, sev1_count/sev2_count/sev3_count,
+has_sos_alert, avg_route_rating, avg_driver_rating, avg_cab_rating, avg_safety_rating,
+avg_marshal_rating, feedback_count, data_quality_flag (unmatched_billing /
+zero_km_billed / stray_severity_value / dtype_drift_row / etc.), source_row_ref
+(traceability for drill-down back to staging).
 
 **Daily aggregate view** — grain date × site × vendor × mode × shift. Aggregates:
 trip_count, avg/median delay, OTA%, no_show_rate, avg_fill_rate, dead_km_total,
@@ -206,6 +240,12 @@ Long-term this belongs in `docs/data-model.md` — keep it here for now.
 - **Definition of done for a step:** a named verification the human performs (see build
   order below), not "it compiles" or "the endpoint returns 200." E.g. "open the morning
   brief screen and see at least one signal with a non-null reference point."
+- **Join-key normalisation rule:** every join on `trip_id` (and `stwid`) must go through
+  the same strip-commas-and-cast step, applied per source file (formats differ — see
+  Table Shapes). Do this once in the staging→fact transform, not ad hoc per query.
+- **`"NA"`-is-null rule:** `trip_nodal="NA"` (and any other literal `"NA"`/`""` string
+  found during Step 0 spot-checks) must be converted to a real SQL null during ingest — a
+  raw CSV `COPY` will not do this for you.
 
 ---
 
@@ -213,7 +253,7 @@ Long-term this belongs in `docs/data-model.md` — keep it here for now.
 
 | Step | Time | Work | Verification |
 |---|---|---|---|
-| 0 | 0:00–0:30 | Dataset recon: schemas, row counts, null rates, join integrity, resolve `trip_fact` grain question. No app code. Update Open Questions below with real column names. | You can state, in one sentence per file, what each raw file contains and how it joins to the others |
+| 0 | 0:00–0:20 | Dataset recon is mostly done (see Table & Signal Shapes and Metric Definitions above, sourced from `data/Dictionary/`). Spend this slot spot-checking the dictionary against a few real rows per file (already done once — repeat if the file changes), confirming the `business_unit`→tenant and mode-taxonomy assumptions below, and deciding the escort/CO2 config values. No app code. | You can state, in one sentence per file, what it contains and how it joins — and confirm the sample rows you looked at match the dictionary's claims |
 | 1 | 0:30–1:30 | Skeleton + ingest + `trip_fact`. Add `spring-boot-starter-jdbc` to pom. | Re-running ingest for the same date produces the same row count in `trip_fact` (idempotency) |
 | 2 | 1:30–2:15 | Aggregate + benchmark views | A query against the benchmark view for one date/vendor returns a non-null value for every reference-point column |
 | 3 | 2:15–3:00 | Scan + triage → ranked signals; startup run + manual `POST /api/scan?date=` | Startup produces a bounded, non-zero, non-huge signal count (e.g. 3–15) for a known date |
@@ -285,22 +325,40 @@ enforcement (column only), any LLM call outside the three defined prompts.
 
 ## Open questions & assumptions
 
-**Blocking — resolve before/at Step 0:**
-1. **No dataset files exist in this repo as of writing.** `src/main/resources/docs/`
-   contains only `problem_statement.pdf` and `prompt.md` — no CSVs. Get the dataset and
-   its file layout before Step 0 starts, or Step 0's 30-minute budget is spent waiting,
-   not analyzing.
-2. Confirm trip grain: per-trip (with an employee/occupant count) or per-employee-leg?
-   Determines `trip_fact` grain (see Table Shapes above).
-3. Confirm whether escort compliance and roster-match fields exist in the sample dataset
-   at all — both are named in the problem statement's domain but may not be present.
-   Have a fallback (drop the metric, or synthesize a config-driven placeholder clearly
-   labeled as such) ready either way.
-4. Confirm cost data granularity (per trip? per vendor invoice/period, needing
-   allocation?) — changes whether cost-per-trip is a direct column or a derived split.
-5. Confirm GPS trace format/granularity (points per trip? sampling interval?) — determines
-   whether dead-mileage, speeding events, and GPS coverage % are cheap SQL or need
-   pre-aggregation in C1.
+**Resolved by the dataset (`src/main/resources/data/`, added after initial planning):**
+- Dataset location, file layout, and grain — see Table & Signal Shapes above. Five CSVs,
+  three months (May–July 2026), five shared `business_unit` values.
+- Trip grain — `trip_fact` is one row per `trip_id`, matching the `ride_data_trip` hub.
+  `emp_data` (per-employee-leg, 1.6M rows) is a stretch-goal enrichment, not required for
+  MVP fill-rate/no-show metrics, which already exist at trip grain.
+- Escort compliance and roster-match — **neither exists as the problem statement's
+  domain language implied.** No `escort_required` field (only `actual_escort` presence) and
+  no roster file. Metric definitions above adjust accordingly: escort *presence* rate
+  instead of compliance; roster-match dropped, planned-vs-actual headcount used instead.
+- GPS trace format — **there is no raw GPS trace file.** GPS-derived signal comes
+  pre-distilled as `alerts_data` events (`OVER_SPEEDING`, `VEHICLE_STOPPAGE`,
+  `DEVICE_NOT_REACHABLE`) plus trip-level `planned_km`/`traveled_km`. GPS coverage % is
+  dropped as a metric — there's no ping-level data to compute it from.
+- Cost data granularity — `bill_data` is line-item grain, `SUM`/`GROUP BY trip_id` before
+  joining to `trip_fact` (row count exceeds trip count, so it is not a 1:1 join).
+
+**Still open — confirm at kickoff, not mid-build:**
+1. `business_unit` as `tenant_id` — the only field that plausibly plays that role. Near-
+   certainly right; confirm in the first few minutes rather than assuming silently.
+2. Mode taxonomy mapping — working assumption: `product_type=BUS` → shuttle,
+   `trip_nodal=NODAL` → nodal, `trip_nodal=HOME`/`"NA"` → home. `product_type=SPOT_2.0`
+   doesn't fit the three-way taxonomy cleanly; keep it as its own mode bucket rather than
+   forcing a guess (see glossary).
+3. Escort-*required* proxy (stretch goal only) — if time permits a "compliance" framing
+   rather than a bare presence rate, the candidate rule is shift-time-based (e.g. shifts
+   starting before 06:00 or after 21:00 via `shift_type`). This is our config rule, not a
+   dataset fact — must be labeled as such anywhere it's shown.
+4. `trip_feedback` rating of `0` — genuine zero score or "unrated"? Confirm before
+   averaging; if ambiguous, exclude zeros from the CSAT denominator and say so in the DQ
+   notes rather than silently including them.
+5. Emission factors for CO2 (by `actual_cab_fuel_type`) and the OTA SLA threshold (minutes
+   late before a trip is "not on time") are our own config values, not in the dataset —
+   pick reasonable defaults in Step 0/1 and label them illustrative in the UI.
 
 **LLM/infra:**
 6. `pom.xml` already wires Spring AI's OpenAI model starter. Confirm an OpenAI API key
@@ -310,5 +368,6 @@ enforcement (column only), any LLM call outside the three defined prompts.
 
 **Non-blocking:**
 8. Demo date: pick the "simulated now" date in advance from the dataset, ideally one with
-   a real, visible incident (a vendor dip, a safety flag) so the demo has a genuine story
-   rather than a flat baseline.
+   a real, visible incident (a vendor/office with a delay or Sev-1 alert spike) so the demo
+   has a genuine story rather than a flat baseline. May–July 2026 is the full range —
+   scan for a standout day/vendor during Step 0.
