@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SyncBit — Leadership Brief</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  @media print {
+    .no-print { display: none !important; }
+    body { background: white; }
+  }
+</style>
+</head>
+<body class="bg-slate-50 text-slate-900">
+<nav class="bg-slate-900 text-white px-6 py-3 flex items-center gap-6 no-print">
+  <span class="font-semibold">SyncBit</span>
+  <a href="/index.html" class="text-sm text-slate-300 hover:text-white">Morning Brief</a>
+  <a href="/leadership.html" class="text-sm font-medium underline">Leadership Brief</a>
+  <a href="/drafts.html" class="text-sm text-slate-300 hover:text-white">Action Queue</a>
+</nav>
+
+<main class="max-w-3xl mx-auto p-6">
+  <div class="flex items-center justify-between mb-6 no-print">
+    <div>
+      <h1 class="text-2xl font-bold">Weekly Leadership Brief</h1>
+      <p class="text-slate-500 text-sm">Forwardable as-is. Every number below traces to a SQL query, not the model.</p>
+    </div>
+    <div class="flex items-center gap-3">
+      <select id="tenant" class="border rounded px-2 py-1 text-sm"></select>
+      <input id="weekEnding" type="date" class="border rounded px-2 py-1 text-sm">
+      <button onclick="window.print()" class="bg-slate-900 text-white text-sm px-3 py-1.5 rounded">Print to PDF</button>
+    </div>
+  </div>
+
+  <div id="content"></div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let META = null;
+
+function fmtMoney(v) { return v === null || v === undefined ? '—' : '$' + Number(v).toLocaleString(undefined, {maximumFractionDigits: 0}); }
+function fmtPct(v) { return v === null || v === undefined ? '—' : (Number(v) * 100).toFixed(1) + '%'; }
+function fmtInt(v) { return v === null || v === undefined ? '—' : Number(v).toLocaleString(); }
+
+function renderNarrative(text) {
+  if (!text) return '<p class="text-slate-400 italic">No brief generated yet for this tenant/week.</p>';
+  return text
+    .split('\n\n')
+    .map(p => '<p class="mb-3">' + p.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br>') + '</p>')
+    .join('');
+}
+
+async function loadMeta() {
+  META = await (await fetch('/api/meta')).json();
+  $('weekEnding').value = META.latestSignalDate;
+  const sel = $('tenant');
+  sel.innerHTML = META.tenants.map(t => `<option value="${t}">${t}</option>`).join('');
+  sel.addEventListener('change', load);
+  $('weekEnding').addEventListener('change', load);
+}
+
+async function load() {
+  const tenantId = $('tenant').value;
+  const weekEnding = $('weekEnding').value;
+  const data = await (await fetch(`/api/briefs/leadership?tenantId=${tenantId}&weekEnding=${weekEnding}`)).json();
+  const r = data.rollup || {};
+  const brief = data.brief || {};
+
+  $('content').innerHTML = `
+    <div class="grid grid-cols-4 gap-3 mb-6 no-print">
+      <div class="bg-white border rounded-lg p-3"><div class="text-xs text-slate-400">Trips</div><div class="text-lg font-bold">${fmtInt(r.total_trips)}</div></div>
+      <div class="bg-white border rounded-lg p-3"><div class="text-xs text-slate-400">Avg OTA</div><div class="text-lg font-bold">${fmtPct(r.avg_ota_pct)}</div></div>
+      <div class="bg-white border rounded-lg p-3"><div class="text-xs text-slate-400">Total cost</div><div class="text-lg font-bold">${fmtMoney(r.total_cost)}</div></div>
+      <div class="bg-white border rounded-lg p-3"><div class="text-xs text-slate-400">Avg no-show</div><div class="text-lg font-bold">${fmtPct(r.avg_no_show_rate)}</div></div>
+    </div>
+    <div class="bg-white border rounded-lg p-6 shadow-sm leading-relaxed">
+      <h1 class="text-xl font-bold mb-1">${tenantId}</h1>
+      <p class="text-slate-500 text-sm mb-4">Week ending ${weekEnding}</p>
+      ${renderNarrative(brief.narrative)}
+    </div>
+  `;
+}
+
+loadMeta().then(load);
+</script>
+</body>
+</html>

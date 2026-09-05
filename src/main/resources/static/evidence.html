@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SyncBit — Evidence</title>
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900">
+<nav class="bg-slate-900 text-white px-6 py-3 flex items-center gap-6">
+  <span class="font-semibold">SyncBit</span>
+  <a href="/index.html" class="text-sm text-slate-300 hover:text-white">Morning Brief</a>
+  <a href="/leadership.html" class="text-sm text-slate-300 hover:text-white">Leadership Brief</a>
+  <a href="/drafts.html" class="text-sm text-slate-300 hover:text-white">Action Queue</a>
+</nav>
+
+<main class="max-w-3xl mx-auto p-6">
+  <a href="/index.html" class="text-sm text-blue-600 hover:underline">&larr; Back to Morning Brief</a>
+
+  <div class="bg-blue-50 border border-blue-200 text-blue-800 text-sm rounded px-3 py-2 my-4">
+    This page is plain SQL against the same views the scan used — zero inference cost. Nothing below came from a model.
+  </div>
+
+  <div id="content"></div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const id = params.get('id');
+
+function fmtNum(v) {
+  if (v === null || v === undefined) return '—';
+  const n = Number(v);
+  return Number.isInteger(n) ? n.toString() : n.toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+// Attribution rows mix numeric columns (trip_count, avg_delay_minutes) with plain
+// strings (delay_reason) - only run actual numbers through fmtNum, pass strings through.
+function cell(v) {
+  if (v === null || v === undefined) return '—';
+  return typeof v === 'number' ? fmtNum(v) : v;
+}
+
+function fmtDate(v) {
+  return v ? String(v).slice(0, 10) : '—';
+}
+
+async function load() {
+  const data = await (await fetch(`/api/signals/${id}/evidence`)).json();
+  const s = data.signal;
+
+  const trendRows = data.trend.map(r => `
+    <tr class="${fmtDate(r.trip_date) === s.date ? 'bg-amber-50 font-semibold' : ''}">
+      <td class="px-3 py-1 border-b">${fmtDate(r.trip_date)}</td>
+      <td class="px-3 py-1 border-b text-right">${fmtNum(r.metric_value)}</td>
+    </tr>`).join('');
+
+  const attrCols = data.attribution.length ? Object.keys(data.attribution[0]) : [];
+  const attrHead = attrCols.map(c => `<th class="px-3 py-1 border-b text-left font-medium">${c}</th>`).join('');
+  const attrRows = data.attribution.map(row => `
+    <tr>${attrCols.map(c => `<td class="px-3 py-1 border-b">${cell(row[c])}</td>`).join('')}</tr>
+  `).join('');
+
+  $('content').innerHTML = `
+    <div class="bg-white border rounded-lg p-5 shadow-sm mb-4">
+      <div class="flex items-center gap-2 mb-1">
+        ${s.safetyFlag ? '<span class="inline-block text-xs font-semibold px-2 py-0.5 rounded bg-red-100 text-red-700">SAFETY</span>' : ''}
+        <span class="text-xs text-slate-400">${s.tenantId} · ${s.office || ''} · ${s.mode || ''} · shift ${s.shiftType || ''}</span>
+      </div>
+      <h1 class="text-xl font-bold">${s.entityId} — ${s.metricName}</h1>
+      <p class="text-sm text-slate-500">${s.date}</p>
+      <dl class="grid grid-cols-2 gap-3 mt-4 text-sm">
+        <div><dt class="text-slate-400">Observed value</dt><dd class="font-semibold">${fmtNum(s.observedValue)}</dd></div>
+        <div><dt class="text-slate-400">Reference (${s.referenceType || '—'})</dt><dd class="font-semibold">${fmtNum(s.referenceValue)}</dd></div>
+        <div><dt class="text-slate-400">Deviation</dt><dd class="font-semibold">${fmtNum(s.deviationMagnitude)}</dd></div>
+        <div><dt class="text-slate-400">Persistence</dt><dd class="font-semibold">${s.persistenceDays > 0 ? (s.persistenceDays + 1) + ' consecutive days' : 'first occurrence'}</dd></div>
+      </dl>
+    </div>
+
+    <div class="bg-white border rounded-lg p-5 shadow-sm mb-4">
+      <h2 class="font-semibold mb-2">Trend — last 7 days, this exact vendor/metric</h2>
+      <table class="w-full text-sm">
+        <thead><tr><th class="px-3 py-1 border-b text-left font-medium">Date</th><th class="px-3 py-1 border-b text-right font-medium">Value</th></tr></thead>
+        <tbody>${trendRows || '<tr><td class="px-3 py-2 text-slate-400" colspan="2">No trend data.</td></tr>'}</tbody>
+      </table>
+    </div>
+
+    <div class="bg-white border rounded-lg p-5 shadow-sm">
+      <h2 class="font-semibold mb-2">Attribution breakdown — by delay reason, this vendor/date</h2>
+      <table class="w-full text-sm">
+        <thead><tr>${attrHead}</tr></thead>
+        <tbody>${attrRows || '<tr><td class="px-3 py-2 text-slate-400">No underlying trips found.</td></tr>'}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+load();
+</script>
+</body>
+</html>

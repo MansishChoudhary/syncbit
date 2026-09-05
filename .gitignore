@@ -31,3 +31,6 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Large source data (too big for git, kept local only) ###
+src/main/resources/data/*.csv
